@@ -10,6 +10,16 @@ def get_password_hash(password: str) -> str:
     hashed_password = bcrypt.hashpw(pwd_bytes, salt)
     return hashed_password.decode('utf-8')
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Kullanıcının girdiği şifreyi, veritabanındaki hash ile karşılaştırır."""
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode('utf-8'), 
+            hashed_password.encode('utf-8')
+        )
+    except ValueError:
+        return False
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -79,7 +89,52 @@ async def get_users():
 
 @app.post("/auth")
 async def authenticate_user(request: Request):
-    return {"code": 401, "reply:Reply-Message": "Authentication not implemented yet"}
+    """Kullanıcı doğrulama ve sonuç dönme"""
+    data = await request.json()
+    
+    username = data.get("User-Name")
+    password = data.get("User-Password")
+    mac_address = data.get("Calling-Station-Id")
+
+    if not username:
+        return {"code": 401, "reply:Reply-Message": "Kullanici adi gerekli"}
+
+    redis_client = database.get_redis_client()
+    failed_attempts_key = f"failed_auth:{username}"
+    
+    attempts = await redis_client.get(failed_attempts_key)
+    if attempts and int(attempts) >= 3:
+        return {"code": 401, "reply:Reply-Message": "Cok fazla hatali deneme. Lutfen 5 dakika bekleyin."}
+
+    pool = database.get_db()
+    async with pool.acquire() as conn:
+        
+        if not password and mac_address:
+            record = await conn.fetchrow(
+                "SELECT value FROM radcheck WHERE username = $1 AND attribute = 'Calling-Station-Id'",
+                username
+            )
+            if record and record['value'] == mac_address:
+                return {"code": 200, "reply:Reply-Message": "MAB Dogrulama Basarili"}
+            else:
+                return {"code": 401, "reply:Reply-Message": "Bilinmeyen MAC Adresi"}
+
+        record = await conn.fetchrow(
+            "SELECT value FROM radcheck WHERE username = $1 AND attribute = 'Bcrypt-Password'",
+            username
+        )
+
+        if record:
+            hashed_pw = record['value']
+            if verify_password(password, hashed_pw):
+                await redis_client.delete(failed_attempts_key)
+                return {"code": 200, "reply:Reply-Message": "Kimlik Dogrulama Basarili"}
+        
+        await redis_client.incr(failed_attempts_key)
+        await redis_client.expire(failed_attempts_key, 300)
+        
+        return {"code": 401, "reply:Reply-Message": "Gecersiz kimlik bilgileri"}
+    
 
 @app.post("/authorize")
 async def authorize_user(request: Request):
