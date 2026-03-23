@@ -138,8 +138,42 @@ async def authenticate_user(request: Request):
 
 @app.post("/authorize")
 async def authorize_user(request: Request):
-    return {"code": 200}
+    """VLAN, policy atribütleri dönme"""
+    data = await request.json()
+    username = data.get("User-Name")
 
+    if not username:
+        return {"code": 401}
+
+    pool = database.get_db()
+    async with pool.acquire() as conn:
+        # 1. Kullanıcının grubunu veritabanından bul
+        record = await conn.fetchrow(
+            "SELECT groupname FROM radusergroup WHERE username = $1",
+            username
+        )
+
+        # Grubu yoksa varsayılan olarak "guest" kabul edelim
+        groupname = record['groupname'] if record else "guest"
+
+        # 2. Dinamik Policy Engine: Gruplara göre VLAN ID belirleme
+        vlan_id = "30"  # Varsayılan Guest VLAN
+        
+        if groupname == "admin":
+            vlan_id = "10"  # Yüksek yetkili ağ
+        elif groupname == "employee":
+            vlan_id = "20"  # Çalışan ağı
+
+        # 3. rlm_rest modülünün beklediği RADIUS formatında yanıt dönme
+        return {
+            "code": 200,
+            "reply:Tunnel-Type": "13",            # VLAN tipi (13)
+            "reply:Tunnel-Medium-Type": "6",      # IEEE-802 (6)
+            "reply:Tunnel-Private-Group-Id": vlan_id, # Belirlediğimiz VLAN ID
+            "reply:Reply-Message": f"Sisteme hosgeldiniz, Grubunuz: {groupname}, VLAN: {vlan_id}"
+        }
+    
+    
 @app.post("/accounting")
 async def handle_accounting(request: Request):
     return {"code": 200}
