@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: nac_postgres
+    env_file:
+      - .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d # Veritabanı tablolarını otomatik kurmak için
+    networks:
+      - nac_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    container_name: nac_redis
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - nac_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: 
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: nac_fastapi
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT}:8000"
+    volumes:
+      - ./api:/app
+    networks:
+      - nac_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/users"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  freeradius:
+    image: freeradius/freeradius-server:latest-3.2
+    container_name: nac_freeradius
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    volumes:
+      - ./radius-config:/etc/raddb
+    networks:
+      - nac_network
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "radclient", "-x", "localhost:1812", "status", "${RADIUS_SECRET}"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  nac_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
