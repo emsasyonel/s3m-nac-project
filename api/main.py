@@ -116,4 +116,65 @@ async def authorize_user(request: Request):
 
 @app.post("/accounting")
 async def handle_accounting(request: Request):
+    """Oturum verisi kaydetme (Start, Update, Stop)"""
+    data = await request.json()
+    
+    status_type = get_radius_val(data, "Acct-Status-Type")
+    session_id = get_radius_val(data, "Acct-Session-Id")
+    username = get_radius_val(data, "User-Name", "unknown")
+    nas_ip = get_radius_val(data, "NAS-IP-Address", "0.0.0.0")
+    
+    try: input_octets = int(get_radius_val(data, "Acct-Input-Octets", 0))
+    except: input_octets = 0
+    try: output_octets = int(get_radius_val(data, "Acct-Output-Octets", 0))
+    except: output_octets = 0
+    try: session_time = int(get_radius_val(data, "Acct-Session-Time", 0))
+    except: session_time = 0
+    
+    if not status_type or not session_id:
+        return JSONResponse(status_code=400, content={"message": "Eksik parametreler"})
+
+    pool = database.get_db()
+    redis_client = database.get_redis_client()
+    now = datetime.now(timezone.utc)
+    
+    async with pool.acquire() as conn:
+        if status_type == "Start":
+            await conn.execute(
+                "INSERT INTO radacct (acctsessionid, username, nasipaddress, acctstarttime, acctinputoctets, acctoutputoctets) VALUES ($1, $2, $3, $4, $5, $6)", 
+                session_id, username, nas_ip, now, input_octets, output_octets
+            )
+            session_data = {"username": username, "nas_ip": nas_ip, "start_time": now.isoformat()}
+            await redis_client.hset(f"session:{session_id}", mapping=session_data)
+            await redis_client.sadd("active_sessions", session_id)
+            
+        elif status_type == "Interim-Update":
+            await conn.execute(
+                "UPDATE radacct SET acctupdatetime = $1, acctinputoctets = $2, acctoutputoctets = $3, acctsessiontime = $4 WHERE acctsessionid = $5", 
+                now, input_octets, output_octets, session_time, session_id
+            )
+            
+        elif status_type == "Stop":
+            await conn.execute(
+                "UPDATE radacct SET acctstoptime = $1, acctinputoctets = $2, acctoutputoctets = $3, acctsessiontime = $4 WHERE acctsessionid = $5", 
+                now, input_octets, output_octets, session_time, session_id
+            )
+            await redis_client.delete(f"session:{session_id}")
+            await redis_client.srem("active_sessions", session_id)
+
     return JSONResponse(status_code=200, content={"code": 200})
+
+@app.get("/sessions/active")
+async def get_active_sessions():
+    """Aktif oturumları Redis üzerinden listeler"""
+    redis_client = database.get_redis_client()
+    session_ids = await redis_client.smembers("active_sessions")
+    
+    sessions = []
+    for sid in session_ids:
+        data = await redis_client.hgetall(f"session:{sid}")
+        if data:
+            data["session_id"] = sid
+            sessions.append(data)
+            
+    return {"status": "ok", "total": len(sessions), "sessions": sessions}
