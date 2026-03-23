@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import bcrypt
 import database
+from datetime import datetime, timezone
 
 def get_password_hash(password: str) -> str:
     pwd_bytes = password.encode('utf-8')
@@ -147,37 +148,105 @@ async def authorize_user(request: Request):
 
     pool = database.get_db()
     async with pool.acquire() as conn:
-        # 1. Kullanıcının grubunu veritabanından bul
         record = await conn.fetchrow(
             "SELECT groupname FROM radusergroup WHERE username = $1",
             username
         )
 
-        # Grubu yoksa varsayılan olarak "guest" kabul edelim
         groupname = record['groupname'] if record else "guest"
 
-        # 2. Dinamik Policy Engine: Gruplara göre VLAN ID belirleme
-        vlan_id = "30"  # Varsayılan Guest VLAN
+        vlan_id = "30"  
         
         if groupname == "admin":
-            vlan_id = "10"  # Yüksek yetkili ağ
+            vlan_id = "10" 
         elif groupname == "employee":
-            vlan_id = "20"  # Çalışan ağı
+            vlan_id = "20"  
 
-        # 3. rlm_rest modülünün beklediği RADIUS formatında yanıt dönme
         return {
             "code": 200,
-            "reply:Tunnel-Type": "13",            # VLAN tipi (13)
-            "reply:Tunnel-Medium-Type": "6",      # IEEE-802 (6)
-            "reply:Tunnel-Private-Group-Id": vlan_id, # Belirlediğimiz VLAN ID
+            "reply:Tunnel-Type": "13",         
+            "reply:Tunnel-Medium-Type": "6",      
+            "reply:Tunnel-Private-Group-Id": vlan_id, 
             "reply:Reply-Message": f"Sisteme hosgeldiniz, Grubunuz: {groupname}, VLAN: {vlan_id}"
         }
     
-    
+
 @app.post("/accounting")
 async def handle_accounting(request: Request):
+    """Oturum verisi kaydetme (Start, Update, Stop)"""
+    data = await request.json()
+    
+    # RADIUS paketinden gelen verileri yakala
+    status_type = data.get("Acct-Status-Type")
+    session_id = data.get("Acct-Session-Id")
+    username = data.get("User-Name", "unknown")
+    nas_ip = data.get("NAS-IP-Address", "0.0.0.0")
+    
+    # Gelen veri miktarı ve süresi (Yoksa 0 kabul et)
+    input_octets = int(data.get("Acct-Input-Octets", 0))
+    output_octets = int(data.get("Acct-Output-Octets", 0))
+    session_time = int(data.get("Acct-Session-Time", 0))
+    
+    if not status_type or not session_id:
+        return {"code": 400, "message": "Eksik parametreler"}
+
+    pool = database.get_db()
+    redis_client = database.get_redis_client()
+    now = datetime.now(timezone.utc)
+    
+    async with pool.acquire() as conn:
+        if status_type == "Start":
+            # 1. Oturum Başlangıcı: Postgres'e yeni kayıt ekle
+            await conn.execute("""
+                INSERT INTO radacct 
+                (acctsessionid, username, nasipaddress, acctstarttime, acctinputoctets, acctoutputoctets) 
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, session_id, username, nas_ip, now, input_octets, output_octets)
+            
+            # 2. Redis'e aktif oturum olarak kaydet
+            session_data = {
+                "username": username,
+                "nas_ip": nas_ip,
+                "start_time": now.isoformat()
+            }
+            await redis_client.hset(f"session:{session_id}", mapping=session_data)
+            await redis_client.sadd("active_sessions", session_id)
+            
+        elif status_type == "Interim-Update":
+            # Ara Güncelleme (Kullanıcı hala içeride, kota/süre güncelleniyor)
+            await conn.execute("""
+                UPDATE radacct 
+                SET acctupdatetime = $1, acctinputoctets = $2, acctoutputoctets = $3, acctsessiontime = $4
+                WHERE acctsessionid = $5
+            """, now, input_octets, output_octets, session_time, session_id)
+            
+        elif status_type == "Stop":
+            # 1. Oturum Bitişi: Postgres'teki kaydı sonlandır
+            await conn.execute("""
+                UPDATE radacct 
+                SET acctstoptime = $1, acctinputoctets = $2, acctoutputoctets = $3, acctsessiontime = $4
+                WHERE acctsessionid = $5
+            """, now, input_octets, output_octets, session_time, session_id)
+            
+            # 2. Redis'ten (Aktif oturumlar listesinden) sil
+            await redis_client.delete(f"session:{session_id}")
+            await redis_client.srem("active_sessions", session_id)
+
+    # İşlem başarılıysa FreeRADIUS'a boş/başarılı bir yanıt dön (Accounting onayı)
     return {"code": 200}
 
 @app.get("/sessions/active")
 async def get_active_sessions():
-    return {"status": "ok", "sessions": []}
+    """Aktif oturumları Redis üzerinden hızlıca sorgular"""
+    redis_client = database.get_redis_client()
+    session_ids = await redis_client.smembers("active_sessions")
+    
+    sessions = []
+    for sid in session_ids:
+        # Her bir oturum detayını Redis'ten çek
+        data = await redis_client.hgetall(f"session:{sid}")
+        if data:
+            data["session_id"] = sid
+            sessions.append(data)
+        
+    return {"status": "ok", "total": len(sessions), "sessions": sessions}
